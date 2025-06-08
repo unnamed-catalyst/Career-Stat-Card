@@ -1,0 +1,82 @@
+body {
+  font-family: sans-serif;
+  background: #121212;
+  color: white;
+  display: flex;
+  justify-content: center;
+  padding: 2rem;
+}
+
+.app {
+  max-width: 500px;
+  width: 100%;
+}
+
+form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin-bottom: 2rem;
+}
+
+input,
+button {
+  padding: 0.75rem;
+  border-radius: 6px;
+  border: none;
+  font-size: 1rem;
+}
+
+.card {
+  background: #1f1f1f;
+  padding: 1.5rem;
+  border-radius: 12px;
+  box-shadow: 0 0 10px #333;
+}
+
+.card h2 {
+  margin: 0;
+}
+
+.card h3 {
+  margin-top: 4px;
+  font-weight: normal;
+  color: #ccc;
+  font-size: 1rem;
+}
+
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  margin-top: 1rem;
+  gap: 0.5rem;
+}
+
+.stat {
+  background: #2b2b2b;
+  padding: 0.5rem;
+  border-radius: 6px;
+  flex: 1 1 45%;
+  display: flex;
+  justify-content: space-between;
+}
+
+.overall {
+  margin-top: 1rem;
+  font-size: 1.25rem;
+  text-align: center;
+  background: #444;
+  padding: 0.75rem;
+  border-radius: 8px;
+}
+
+.hover-hint {
+  font-size: 0.9rem;
+  color: #aaa;
+  margin-top: 0.5rem;
+  text-align: center;
+}
+
+.message {
+  margin: 0 auto;
+}
