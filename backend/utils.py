@@ -9,6 +9,28 @@ load_dotenv()
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 
+def get_latest_flash_model():
+    try:
+        all_models = list(client.models.list())
+
+        flash_models = [
+            m.name
+            for m in all_models
+            if "gemini" in m.name.lower() and "flash" in m.name.lower()
+        ]
+
+        if flash_models:
+            # Descending order
+            flash_models.sort(reverse=True)
+            print(f"Auto-selected model: {flash_models[0]}")
+            return flash_models[0]
+
+    except Exception as e:
+        print(f"Model lookup failed: {e}")
+
+    return "gemini-1.5-flash"
+
+
 def parse_pdf(file_path):
     doc = fitz.open(file_path)
     text = ""
@@ -67,7 +89,8 @@ Resume:
 Job Description:
 {job_description}
 """
-    response = client.models.generate_content(model="gemini-flash", contents=prompt)
+    selected_model = get_latest_flash_model()
+    response = client.models.generate_content(model=selected_model, contents=prompt)
     try:
         return response.text
     except json.JSONDecodeError:
