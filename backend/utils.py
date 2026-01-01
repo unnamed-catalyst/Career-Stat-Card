@@ -2,13 +2,11 @@ import fitz  # PyMuPDF
 import os
 import json
 import re
-import google.generativeai as genai
+from google import genai
 from dotenv import load_dotenv
 
 load_dotenv()
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-
-model = genai.GenerativeModel("gemini-2.5-flash-preview-05-20")
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 
 def parse_pdf(file_path):
@@ -69,7 +67,7 @@ Resume:
 Job Description:
 {job_description}
 """
-    response = model.generate_content(prompt)
+    response = client.models.generate_content(model="gemini-flash", contents=prompt)
     try:
         return response.text
     except json.JSONDecodeError:
