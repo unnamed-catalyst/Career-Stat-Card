@@ -105,33 +105,44 @@ def parse_response(text):
     scores = {}
     explanations = {}
 
-    # First line: "Nawaf Nazeer - Machine Learning Engineer"
-    if "-" in lines[0]:
-        name_part, role_part = lines[0].split(" - ", 1)
-        name = name_part.strip()
-        role = role_part.strip()
-
     current_category = None
     for i, line in enumerate(lines):
         line = line.strip()
+        if not line:
+            continue
 
-        # Match Experience
-        if line.startswith("**Experience"):
-            match = re.search(r"\*\*Experience - (.*?)\*\*", line)
-            if match:
-                experience = match.group(1).strip()
+        # Match name/role line — with or without ** bold markers
+        if name is None and " - " in line:
+            cleaned = line.replace("**", "").replace("##", "").strip()
+            if " - " in cleaned:
+                parts = cleaned.split(" - ", 1)
+                # Make sure it's not a score line
+                if not parts[1].strip().isdigit():
+                    name = parts[0].strip()
+                    role = parts[1].strip()
+                    continue
+
+        # Match experience line — handles any format variation
+        if experience is None and re.search(
+            r"experience|years|multiplier", line, re.IGNORECASE
+        ):
+            cleaned = line.replace("**", "").replace("*", "").strip()
+            if cleaned:
+                experience = cleaned
+            continue
 
         # Match **[Category] - [Score]**
-        elif line.startswith("**") and " - " in line:
-            match = re.search(r"\*\*(.*?) - (\d+)\*\*", line)
-            if match:
-                current_category = match.group(1).strip()
-                score = int(match.group(2))
-                scores[current_category] = score
-
-                # Grab explanation from next line if available
-                if i + 1 < len(lines):
-                    explanations[current_category] = lines[i + 1].strip()
+        match = re.search(r"\*\*(.*?) - ([4-9]\d)\*\*", line)
+        if match:
+            current_category = match.group(1).strip()
+            score = int(match.group(2))
+            scores[current_category] = score
+            # Grab explanation from next non-empty line
+            for j in range(i + 1, min(i + 3, len(lines))):
+                next_line = lines[j].strip().replace("*", "")
+                if next_line and not re.search(r"\*\*.*- \d+\*\*", next_line):
+                    explanations[current_category] = next_line
+                    break
 
     return {
         "name": name,
