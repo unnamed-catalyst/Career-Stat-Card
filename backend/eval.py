@@ -79,7 +79,7 @@ def main() -> int:
     parser.add_argument("--runs", type=int, default=2, help="runs per persona (default 2)")
     parser.add_argument("--model", help="pin a model, e.g. gemini-2.5-flash")
     parser.add_argument("--max-std", type=float, default=5.0, help="max Overall std dev per persona")
-    parser.add_argument("--sleep", type=float, default=2.0, help="seconds between calls (rate limits)")
+    parser.add_argument("--sleep", type=float, default=5.0, help="seconds between calls (stays under free-tier per-minute limits)")
     parser.add_argument("--only", nargs="*", help="persona ids to run")
     args = parser.parse_args()
 
