@@ -1,19 +1,19 @@
-# Using a slim Python base image
 FROM python:3.11-slim
 
-# Working directory in the container
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
-# Installing the necessary dependencies
 COPY requirements.txt .
-
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copying the rest of the application
+# .dockerignore keeps .env, tests and eval reports out of the image.
 COPY . .
 
-# Exposing the port for FastAPI to run on
+RUN useradd --create-home appuser
+USER appuser
+
 EXPOSE 8000
 
-# Running the FastAPI app
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Render (and most hosts) pass the port in $PORT.
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]

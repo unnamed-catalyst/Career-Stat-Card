@@ -1,202 +1,202 @@
 """
-eval.py — Offline evaluation harness for Career Stat Card.
+eval.py: live evaluation harness for Career Stat Card.
 
-Tests the core LLM workflow (analyze_resume + parse_response) against
-fixture resumes to catch schema failures and score bound violations
-before they surface in production.
+Runs fixture personas through the real Gemini pipeline (prompt, structured
+output, validation, failover, deterministic scoring) and measures:
+
+- Validity: every run returns a schema-valid card.
+- Calibration: each persona's Overall lands in its expected band.
+- Ordering: stronger candidates outrank weaker ones (e.g. senior > new grad).
+- Consistency: standard deviation of the Overall across repeated runs.
+- Grounding: share of evidence quotes found verbatim in the resume.
+- Latency: p50 / p95 seconds per analysis, and which models served them.
 
 Usage:
-    GEMINI_API_KEY=your_key python eval.py
+    GEMINI_API_KEY=... python eval.py                 # 2 runs per persona
+    GEMINI_API_KEY=... python eval.py --runs 3 --model gemini-2.5-flash
+    python eval.py --max-std 4                        # fail if a persona varies more
+
+Writes eval_results/report-<timestamp>.json and eval_results/latest.md.
+Exits 1 if any check fails, so it can gate CI.
 """
 
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import statistics
 import sys
-from utils import analyze_resume, parse_response
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 
-# ── Constants ────────────────────────────────────────────────────────────────
+from dotenv import load_dotenv
 
-REQUIRED_CATEGORIES = [
-    "Technical Proficiency",
-    "Problem Solving",
-    "Communication",
-    "Domain Fit",
-    "Initiative & Impact",
-    "Adaptability",
-    "Overall Score",
-]
+load_dotenv()
 
-SCORE_MIN = 45
-SCORE_MAX = 99
+import analyzer  # noqa: E402
+from eval_fixtures import FIXTURES, ORDERING  # noqa: E402
+from schemas import Meta  # noqa: E402
+from scoring import build_card  # noqa: E402
 
-# ── Fixture resumes ───────────────────────────────────────────────────────────
-
-FIXTURES = [
-    {
-        "id": "senior_ml_engineer",
-        "description": "Senior ML engineer, 8 years experience",
-        "resume": """
-            Jane Smith
-            Senior Machine Learning Engineer — 8 years of experience
-
-            Experience:
-            - Led ML platform team at Acme Corp (2019–present): built real-time inference
-              pipeline serving 50M predictions/day on AWS SageMaker; reduced p99 latency
-              from 420ms to 85ms via model quantisation and batching.
-            - ML Engineer at DataCo (2016–2019): shipped NLP classification models for
-              customer support routing (92% accuracy); owned model retraining pipeline
-              in Airflow.
-
-            Skills: Python, PyTorch, TensorFlow, FastAPI, AWS (SageMaker, Lambda, S3),
-            Docker, Kubernetes, SQL, Spark, MLflow, Airflow.
-
-            Education: M.Sc. Computer Science (Machine Learning), Stanford University, 2016.
-        """,
-        "job_description": "Senior Machine Learning Engineer at a cloud-native AI startup",
-        "expected_overall_min": 75,
-    },
-    {
-        "id": "fresh_graduate",
-        "description": "Fresh CS graduate, no industry experience",
-        "resume": """
-            Alex Johnson
-            Computer Science Graduate — 0 years of industry experience
-
-            Education: B.Sc. Computer Science, University of Toronto, 2024. GPA 3.7.
-
-            Projects:
-            - Built a sentiment analysis classifier using BERT fine-tuning (PyTorch) as
-              a course project; achieved 89% accuracy on SST-2.
-            - Developed a REST API in Flask for a to-do app; deployed on Heroku.
-
-            Skills: Python, Java, PyTorch, Flask, Git, SQL (basic).
-        """,
-        "job_description": "Junior Software Engineer",
-        "expected_overall_min": 45,
-    },
-    {
-        "id": "career_changer",
-        "description": "Finance professional transitioning into ML",
-        "resume": """
-            Michael Lee
-            Quantitative Analyst — 6 years in finance, transitioning to ML engineering
-
-            Experience:
-            - Quant Analyst at Hedge Fund XYZ (2018–present): built statistical models
-              in Python (pandas, numpy, scikit-learn) for equity signal generation;
-              automated reporting pipelines that saved 12 hrs/week.
-            - Analyst at Investment Bank ABC (2016–2018): financial modelling in Excel
-              and Python; presented findings to senior stakeholders.
-
-            Recent upskilling: Completed fast.ai deep learning course; built an image
-            classifier deployed on a Flask API; studying MLOps on Coursera.
-
-            Skills: Python, scikit-learn, pandas, numpy, SQL, Git, basic PyTorch.
-
-            Education: B.Sc. Mathematics & Statistics, McGill University, 2016.
-        """,
-        "job_description": "Machine Learning Engineer at an automotive AI company",
-        "expected_overall_min": 60,
-    },
-]
-
-# ── Assertions ────────────────────────────────────────────────────────────────
+RESULTS_DIR = Path(__file__).parent / "eval_results"
 
 
-def assert_schema(parsed: dict, fixture_id: str) -> list[str]:
-    """Check all required fields are present and non-null."""
-    failures = []
-
-    for field in ("name", "target_role", "experience", "overall_score"):
-        if not parsed.get(field):
-            failures.append(f"[{fixture_id}] Missing required field: '{field}'")
-
-    for category in REQUIRED_CATEGORIES:
-        if category not in parsed.get("scores", {}):
-            failures.append(f"[{fixture_id}] Missing score category: '{category}'")
-        if category not in parsed.get("explanations", {}):
-            failures.append(f"[{fixture_id}] Missing explanation for: '{category}'")
-
-    return failures
+def percentile(values: list[float], pct: float) -> float:
+    ordered = sorted(values)
+    k = (len(ordered) - 1) * pct / 100
+    lo, hi = int(k), min(int(k) + 1, len(ordered) - 1)
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * (k - lo)
 
 
-def assert_score_bounds(parsed: dict, fixture_id: str) -> list[str]:
-    """Check all scores fall within [SCORE_MIN, SCORE_MAX]."""
-    failures = []
-    for category, score in parsed.get("scores", {}).items():
-        if not (SCORE_MIN <= score <= SCORE_MAX):
-            failures.append(
-                f"[{fixture_id}] '{category}' score {score} out of bounds "
-                f"[{SCORE_MIN}, {SCORE_MAX}]"
-            )
-    return failures
+def run_once(fixture: dict) -> dict:
+    started = time.perf_counter()
+    try:
+        assessment, model, attempts = analyzer.assess(fixture["resume"], fixture["job_description"])
+    except analyzer.AnalysisError as exc:
+        return {"ok": False, "error": exc.code, "seconds": time.perf_counter() - started}
+    seconds = time.perf_counter() - started
+    meta = Meta(model=model, latency_ms=int(seconds * 1000), attempts=attempts, job_description_provided=True)
+    card = build_card(assessment, fixture["resume"], meta)
+    quotes = [s for s in assessment.model_dump().values() if isinstance(s, dict) and s.get("evidence")]
+    return {
+        "ok": True,
+        "seconds": seconds,
+        "model": model,
+        "attempts": attempts,
+        "overall": card.overall,
+        "tier": card.tier,
+        "years": card.years_of_experience,
+        "scores": {s.code: s.score for s in card.stats},
+        "evidence_given": len(quotes),
+        "evidence_verified": sum(s.evidence_verified for s in card.stats),
+    }
 
 
-def assert_overall_floor(parsed: dict, fixture: dict) -> list[str]:
-    """Check overall score meets the fixture's expected minimum."""
-    failures = []
-    overall = parsed.get("overall_score")
-    floor = fixture["expected_overall_min"]
-    if overall is not None and overall < floor:
-        failures.append(
-            f"[{fixture['id']}] Overall score {overall} below expected "
-            f"minimum {floor} for '{fixture['description']}'"
-        )
-    return failures
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--runs", type=int, default=2, help="runs per persona (default 2)")
+    parser.add_argument("--model", help="pin a model, e.g. gemini-2.5-flash")
+    parser.add_argument("--max-std", type=float, default=5.0, help="max Overall std dev per persona")
+    parser.add_argument("--sleep", type=float, default=2.0, help="seconds between calls (rate limits)")
+    parser.add_argument("--only", nargs="*", help="persona ids to run")
+    args = parser.parse_args()
 
+    if args.model:
+        os.environ["GEMINI_MODEL"] = args.model
+    fixtures = [f for f in FIXTURES if not args.only or f["id"] in args.only]
 
-# ── Runner ────────────────────────────────────────────────────────────────────
+    print(f"\nCareer Stat Card eval: {len(fixtures)} personas x {args.runs} runs\n")
+    results: dict[str, list[dict]] = {}
+    for fx in fixtures:
+        results[fx["id"]] = []
+        for i in range(args.runs):
+            r = run_once(fx)
+            results[fx["id"]].append(r)
+            status = f"overall {r['overall']:>2} {r['tier']:<6} {r['seconds']:5.1f}s {r['model']}" if r["ok"] else f"ERROR {r['error']}"
+            print(f"  {fx['id']:<20} run {i + 1}: {status}")
+            time.sleep(args.sleep)
 
-
-def run_eval():
-    total = len(FIXTURES)
-    passed = 0
-    all_failures = []
-
-    print(f"\n{'─' * 55}")
-    print(f"  Career Stat Card — Eval Harness ({total} fixtures)")
-    print(f"{'─' * 55}\n")
-
-    for fixture in FIXTURES:
-        fid = fixture["id"]
-        print(f"  Running: {fid} ({fixture['description']}) ...", end=" ", flush=True)
-
-        try:
-            raw = analyze_resume(fixture["resume"], fixture["job_description"])
-            parsed = parse_response(raw)
-            # print(f"    parsed: {parsed}")
-        except Exception as e:
-            msg = f"[{fid}] Exception during LLM call or parse: {e}"
-            all_failures.append(msg)
-            print("FAIL")
+    failures: list[str] = []
+    rows = []
+    for fx in fixtures:
+        runs = results[fx["id"]]
+        ok_runs = [r for r in runs if r["ok"]]
+        if len(ok_runs) < len(runs):
+            failures.append(f"{fx['id']}: {len(runs) - len(ok_runs)} run(s) returned no card")
+        if not ok_runs:
+            rows.append({"id": fx["id"], "valid": f"0/{len(runs)}"})
             continue
-
-        failures = (
-            assert_schema(parsed, fid)
-            + assert_score_bounds(parsed, fid)
-            + assert_overall_floor(parsed, fixture)
+        overalls = [r["overall"] for r in ok_runs]
+        lo, hi = fx["expected_overall"]
+        mean = statistics.mean(overalls)
+        std = statistics.pstdev(overalls) if len(overalls) > 1 else 0.0
+        in_band = all(lo <= o <= hi for o in overalls)
+        if not in_band:
+            failures.append(f"{fx['id']}: Overall {overalls} outside expected {lo}-{hi}")
+        if std > args.max_std:
+            failures.append(f"{fx['id']}: Overall std dev {std:.1f} > {args.max_std}")
+        rows.append(
+            {
+                "id": fx["id"],
+                "valid": f"{len(ok_runs)}/{len(runs)}",
+                "overalls": overalls,
+                "mean": round(mean, 1),
+                "std": round(std, 2),
+                "expected": f"{lo}-{hi}",
+                "in_band": in_band,
+            }
         )
 
-        if failures:
-            all_failures.extend(failures)
-            print("FAIL")
+    means = {r["id"]: r["mean"] for r in rows if "mean" in r}
+    ordering = []
+    for higher, lower in ORDERING:
+        if higher in means and lower in means:
+            passed = means[higher] > means[lower]
+            ordering.append({"higher": higher, "lower": lower, "passed": passed})
+            if not passed:
+                failures.append(f"ordering: {higher} ({means[higher]}) should beat {lower} ({means[lower]})")
+
+    all_ok = [r for runs in results.values() for r in runs if r["ok"]]
+    total_runs = sum(len(v) for v in results.values())
+    secs = [r["seconds"] for r in all_ok]
+    given = sum(r["evidence_given"] for r in all_ok)
+    verified = sum(r["evidence_verified"] for r in all_ok)
+    models: dict[str, int] = {}
+    for r in all_ok:
+        models[r["model"]] = models.get(r["model"], 0) + 1
+
+    summary = {
+        "valid_cards": f"{len(all_ok)}/{total_runs}",
+        "in_band": f"{sum(1 for r in rows if r.get('in_band'))}/{len(rows)}",
+        "ordering": f"{sum(o['passed'] for o in ordering)}/{len(ordering)}",
+        "max_std": max((r["std"] for r in rows if "std" in r), default=None),
+        "latency_p50_s": round(percentile(secs, 50), 1) if secs else None,
+        "latency_p95_s": round(percentile(secs, 95), 1) if secs else None,
+        "evidence_verified": f"{verified}/{given}" if given else "0/0",
+        "models": models,
+        "passed": not failures,
+    }
+
+    print("\n  Persona               valid  overall(s)        mean   std  expected  band")
+    for r in rows:
+        if "mean" in r:
+            print(f"  {r['id']:<20} {r['valid']:>5}  {str(r['overalls']):<16} {r['mean']:>5} {r['std']:>5}  {r['expected']:>8}  {'ok' if r['in_band'] else 'FAIL'}")
         else:
-            passed += 1
-            overall = parsed.get("overall_score", "?")
-            print(f"PASS  (overall: {overall})")
+            print(f"  {r['id']:<20} {r['valid']:>5}  no cards")
+    print("\n  " + "  ".join(f"{k}={v}" for k, v in summary.items() if k != "models"))
+    print(f"  models used: {models}")
 
-    print(f"\n{'─' * 55}")
-    print(f"  Results: {passed}/{total} passed\n")
+    RESULTS_DIR.mkdir(exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    report = {"timestamp": stamp, "runs_per_persona": args.runs, "summary": summary, "personas": rows, "ordering": ordering, "failures": failures, "raw": results}
+    (RESULTS_DIR / f"report-{stamp}.json").write_text(json.dumps(report, indent=2))
+    md = [
+        f"# Eval report ({stamp})",
+        "",
+        f"{len(fixtures)} personas x {args.runs} runs. Passed: **{summary['passed']}**",
+        "",
+        "| Metric | Value |",
+        "| --- | --- |",
+        *[f"| {k} | {v} |" for k, v in summary.items()],
+        "",
+        "| Persona | Valid | Overalls | Mean | Std | Expected | In band |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+        *[f"| {r['id']} | {r['valid']} | {r.get('overalls', '')} | {r.get('mean', '')} | {r.get('std', '')} | {r.get('expected', '')} | {r.get('in_band', '')} |" for r in rows],
+    ]
+    if failures:
+        md += ["", "## Failures", "", *[f"- {f}" for f in failures]]
+    (RESULTS_DIR / "latest.md").write_text("\n".join(md) + "\n")
 
-    if all_failures:
-        print("  Failures:")
-        for f in all_failures:
-            print(f"    ✗ {f}")
-        print()
-        sys.exit(1)
-    else:
-        print("  All checks passed.")
-        print(f"{'─' * 55}\n")
-        sys.exit(0)
+    if failures:
+        print("\n  Failures:")
+        for f in failures:
+            print(f"    x {f}")
+        return 1
+    print("\n  All checks passed.\n")
+    return 0
 
 
 if __name__ == "__main__":
-    run_eval()
+    sys.exit(main())
