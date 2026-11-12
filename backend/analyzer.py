@@ -174,12 +174,27 @@ def _call(client, model: str, prompt: str, timeout_s: float) -> LLMAssessment:
     return LLMAssessment.model_validate_json(_generate(client, model, prompt, timeout_s))
 
 
+def _request_models(candidates: list[str]) -> list[str]:
+    """The models one request may try, best first.
+
+    Capped at MAX_MODELS_PER_REQUEST, but the last slot is kept for the best
+    Flash-Lite model. Lite ranks after every full Flash model, so without this
+    a long list of new (and often overloaded) Flash releases would push the
+    most reliable fallback out of the request entirely.
+    """
+    picked = candidates[:MAX_MODELS_PER_REQUEST]
+    if any("lite" in m for m in picked):
+        return picked
+    lite = next((m for m in candidates if "lite" in m), None)
+    return picked[:-1] + [lite] if lite else picked
+
+
 def assess(resume_text: str, job_description: str, runtime: _Runtime | None = None) -> tuple[LLMAssessment, str, int]:
     """Return (assessment, model_used, attempts). Raises AnalysisError."""
     runtime = runtime or get_runtime()
     prompt = build_prompt(resume_text, job_description)
     deadline = time.monotonic() + TOTAL_BUDGET_S
-    queue = [(m, 1) for m in runtime.selector.candidates()[:MAX_MODELS_PER_REQUEST]]
+    queue = [(m, 1) for m in _request_models(runtime.selector.candidates())]
     pending: dict = {}
     attempts = 0
     last_error: Exception | None = None
@@ -194,10 +209,27 @@ def assess(resume_text: str, job_description: str, runtime: _Runtime | None = No
         attempts += 1
         pending[pool.submit(_call, runtime.client, model, prompt, max(1.0, remaining - 1))] = (model, try_no)
 
+    # Soonest model that only asked us to slow down: (time it can be retried, model).
+    retry_at: tuple[float, str] | None = None
+
     try:
         launch()
         next_hedge = time.monotonic() + HEDGE_AFTER_S
-        while pending:
+        while True:
+            if not pending:
+                # Every option is used up. If a model was only rate limited for
+                # a short while and that fits in the budget, wait and retry it
+                # instead of failing: "try again in 35 s" beats an error.
+                if queue or retry_at is None or retry_at[0] + MIN_CALL_S > deadline:
+                    break
+                wait_s = max(0.0, retry_at[0] - time.monotonic())
+                log.info("All models busy; retrying %s in %.0fs (rate limit)", retry_at[1], wait_s)
+                time.sleep(wait_s)
+                queue.append((retry_at[1], 1))
+                retry_at = None
+                launch()
+                next_hedge = time.monotonic() + HEDGE_AFTER_S
+                continue
             now = time.monotonic()
             if now >= deadline:
                 break
@@ -228,7 +260,11 @@ def assess(resume_text: str, job_description: str, runtime: _Runtime | None = No
                     log.warning("Gemini error on %s (status %s): %s", model, status, str(exc)[:200])
                     if status in (401, 403):
                         raise AnalysisError("The server's Gemini API key was rejected.", 503, "misconfigured") from exc
-                    runtime.selector.mark_failed(model, cooldown_for_error(status, str(exc)))
+                    cooldown = cooldown_for_error(status, str(exc))
+                    runtime.selector.mark_failed(model, cooldown)
+                    if status == 429 and cooldown < TOTAL_BUDGET_S:
+                        candidate = (time.monotonic() + cooldown, model)
+                        retry_at = min(retry_at, candidate) if retry_at else candidate
                 else:
                     runtime.selector.mark_ok(model)
                     return assessment, model, attempts

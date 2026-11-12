@@ -157,6 +157,59 @@ def test_all_models_failing_gives_friendly_error(monkeypatch):
     assert len(calls) <= analyzer.MAX_MODELS_PER_REQUEST
 
 
+def test_request_keeps_a_slot_for_flash_lite():
+    flash = [f"gemini-3.{v}-flash" for v in range(9, 1, -1)]  # 8 full Flash models
+    picked = analyzer._request_models(flash + ["gemini-flash-latest", "gemini-3.5-flash-lite"])
+    assert len(picked) == analyzer.MAX_MODELS_PER_REQUEST
+    assert picked[-1] == "gemini-3.5-flash-lite"
+    assert picked[:-1] == flash[: analyzer.MAX_MODELS_PER_REQUEST - 1]
+    # Short lists and lists that already include Lite are left alone.
+    assert analyzer._request_models(["gemini-3.8-flash", "gemini-2.5-flash-lite"]) == ["gemini-3.8-flash", "gemini-2.5-flash-lite"]
+    assert analyzer._request_models(["gemini-3.8-flash"]) == ["gemini-3.8-flash"]
+
+
+def test_busy_flash_models_fall_back_to_lite(monkeypatch):
+    # Nov 2026: every full Flash model was overloaded; only Lite answered.
+    listing = [(f"models/gemini-3.{v}-flash", GEN) for v in range(8, 2, -1)] + [("models/gemini-3.1-flash-lite", GEN)]
+    responses = {f"gemini-3.{v}-flash": [FakeAPIError(503)] for v in range(8, 2, -1)}
+    responses["gemini-3.1-flash-lite"] = [GOOD]
+    _, generate, calls = make_runtime(responses)
+    runtime = analyzer._Runtime(client=None, selector=ModelSelector(lambda: listing))
+    monkeypatch.setattr(analyzer, "_generate", generate)
+    _, model, _ = analyzer.assess(RESUME_TEXT, "", runtime)
+    assert model == "gemini-3.1-flash-lite"
+
+
+class RateLimited(FakeAPIError):
+    def __init__(self, retry_delay):
+        super().__init__(429)
+        self.args = (f"429 RESOURCE_EXHAUSTED. {{'retryDelay': '{retry_delay}'}}",)
+
+
+def test_short_rate_limit_is_waited_out_instead_of_failing(monkeypatch):
+    # The only working model hits its per-minute limit; Google says retry in 35 s.
+    runtime, generate, calls = make_runtime({"gemini-3.8-flash": [RateLimited("35s"), GOOD], "gemini-2.5-flash": [FakeAPIError(503)]})
+    slept = []
+    monkeypatch.setattr(analyzer, "_generate", generate)
+    monkeypatch.setattr(analyzer.time, "sleep", slept.append)
+    _, model, attempts = analyzer.assess(RESUME_TEXT, "", runtime)
+    assert model == "gemini-3.8-flash"
+    assert calls[0] == calls[-1] == "gemini-3.8-flash"
+    assert len(slept) == 1 and 30 <= slept[0] <= 35
+
+
+def test_long_rate_limit_is_not_waited_for(monkeypatch):
+    # A daily quota (retry in hours) must fail fast with the friendly error.
+    runtime, generate, calls = make_runtime({"gemini-3.8-flash": [RateLimited("50000s")], "gemini-2.5-flash": [FakeAPIError(503)]})
+    slept = []
+    monkeypatch.setattr(analyzer, "_generate", generate)
+    monkeypatch.setattr(analyzer.time, "sleep", slept.append)
+    with pytest.raises(analyzer.AnalysisError) as err:
+        analyzer.assess(RESUME_TEXT, "", runtime)
+    assert err.value.code == "model_unavailable"
+    assert slept == []
+
+
 def test_prompt_wraps_resume_and_handles_missing_job():
     prompt = analyzer.build_prompt("RESUME BODY", "")
     assert "<resume>\nRESUME BODY\n</resume>" in prompt
