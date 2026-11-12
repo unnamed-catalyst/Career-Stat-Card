@@ -87,7 +87,10 @@ def main() -> int:
         os.environ["GEMINI_MODEL"] = args.model
     fixtures = [f for f in FIXTURES if not args.only or f["id"] in args.only]
 
-    print(f"\nCareer Stat Card eval: {len(fixtures)} personas x {args.runs} runs\n")
+    # The server probes models at startup before any user arrives; do the same
+    # so the eval measures what users see, not a cold, unprobed first request.
+    probed = analyzer.probe_models()
+    print(f"\nCareer Stat Card eval: {len(fixtures)} personas x {args.runs} runs (probe: {probed or 'no model answered'})\n")
     results: dict[str, list[dict]] = {}
     for fx in fixtures:
         results[fx["id"]] = []

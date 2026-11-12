@@ -174,12 +174,27 @@ def _call(client, model: str, prompt: str, timeout_s: float) -> LLMAssessment:
     return LLMAssessment.model_validate_json(_generate(client, model, prompt, timeout_s))
 
 
+def _request_models(candidates: list[str]) -> list[str]:
+    """The models one request may try, best first.
+
+    Capped at MAX_MODELS_PER_REQUEST, but the last slot is kept for the best
+    Flash-Lite model. Lite ranks after every full Flash model, so without this
+    a long list of new (and often overloaded) Flash releases would push the
+    most reliable fallback out of the request entirely.
+    """
+    picked = candidates[:MAX_MODELS_PER_REQUEST]
+    if any("lite" in m for m in picked):
+        return picked
+    lite = next((m for m in candidates if "lite" in m), None)
+    return picked[:-1] + [lite] if lite else picked
+
+
 def assess(resume_text: str, job_description: str, runtime: _Runtime | None = None) -> tuple[LLMAssessment, str, int]:
     """Return (assessment, model_used, attempts). Raises AnalysisError."""
     runtime = runtime or get_runtime()
     prompt = build_prompt(resume_text, job_description)
     deadline = time.monotonic() + TOTAL_BUDGET_S
-    queue = [(m, 1) for m in runtime.selector.candidates()[:MAX_MODELS_PER_REQUEST]]
+    queue = [(m, 1) for m in _request_models(runtime.selector.candidates())]
     pending: dict = {}
     attempts = 0
     last_error: Exception | None = None
